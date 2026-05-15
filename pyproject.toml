@@ -1,0 +1,30 @@
+[project]
+name = "q3-reranker"
+version = "0.1.0"
+description = "Q3 demo: LLM listwise reranking + citation-graph reranking for academic paper search"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "numpy>=1.26",
+    "bm25s>=0.2",
+    "sentence-transformers>=3.0",
+    "python-dotenv>=1.0",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+google = ["google-genai>=0.4"]
+
+[project.scripts]
+q3-demo = "q3_reranker.demo:main"
+q3-eval = "q3_reranker.eval:main"
+q3-web  = "q3_reranker.web_demo:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["q3_reranker*"]
