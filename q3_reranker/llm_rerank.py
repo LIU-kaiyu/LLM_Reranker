@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache" / "llm"
 
 DEFAULT_MODEL = "claude-haiku-4-5"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_WINDOW_SIZE = 20
 DEFAULT_STRIDE = 10
 DEFAULT_NUM_PASSES = 1
@@ -134,7 +134,17 @@ class DeepSeekBackend:
                 {"role": "user", "content": user},
             ],
         )
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            reasoning = getattr(resp.choices[0].message, "reasoning_content", None)
+            if reasoning:
+                logger.warning(
+                    "DeepSeek %s returned empty content with non-empty "
+                    "reasoning_content — the model may have answered only "
+                    "in its thinking trace. Returning empty string.",
+                    self.model,
+                )
+        return text
 
 
 def get_backend(name: str | None = None) -> LLMBackend:

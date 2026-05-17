@@ -187,6 +187,28 @@ entries.
   - `dense` = 0.514
   - `bm25` = 0.338
 
+### Run 3 — RRF + cross-encoder on arXiv (2026-05-16)
+- Stages: all 8.
+- Source: `RETRIEVAL_SOURCE=arxiv`, `limit=30`, `--no-llm`.
+- Rankers: ss_default, bm25, dense, rrf(default+bm25+dense), cross_encoder.
+- Key finding: arXiv pool contains labeled papers only on Stages 1 and 3;
+  Stages 2, 5, 6, 7, 8, 9 return 0 labeled papers because gold was built
+  from SerpAPI Scholar, not arXiv. All-zero stages confirm retrieval
+  mismatch, not reranking failure.
+- Cross-stage mean NDCG@10 (arXiv source):
+  - `dense` = **0.251**
+  - `rrf(default+bm25+dense)` = 0.173
+  - `cross_encoder` (MS MARCO) = 0.145
+  - `bm25` = 0.138
+  - `ss_default` = 0.081
+- Stage 1 (LLM reranking, 5 labeled in pool):
+  - RRF = **0.869** > dense 0.844 > bm25 0.806 > cross_encoder 0.776 > ss_default 0.211
+  - RRF correctly fuses dense + bm25 to beat individual rankers.
+  - Cross-encoder underperforms dense — expected MS MARCO / scientific-text domain mismatch.
+- Stage 3 (Agentic RAG, 3 labeled in pool):
+  - dense = **1.000** (perfect) > cross_encoder 0.387 > rrf 0.333 > bm25 0.301 > ss_default 0.000
+  - RRF pulled below dense here because ss_default and bm25 add noise on this query.
+
 ### Run 2 — expanded benchmark (this run, 2026-05-15)
 - Stages: 1, 2, 3, 5, 6, 7, 8, 9 (≈146 papers).
 - `limit=30`, DeepSeek `deepseek-chat`, λ=0.7.

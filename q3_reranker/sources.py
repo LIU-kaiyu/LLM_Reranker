@@ -31,7 +31,11 @@ def search(query: str, limit: int = 20, **kwargs: Any) -> list[Paper]:
         from .retriever import search as _search
 
         return _search(query, limit=limit, **kwargs)
+    if source == "arxiv":
+        from .arxiv_retriever import search as _search
+
+        return _search(query, limit=limit, **kwargs)
     raise ValueError(
         f"Unknown RETRIEVAL_SOURCE={source!r}; "
-        f"expected 'serpapi' or 'semantic_scholar'."
+        f"expected 'serpapi', 'semantic_scholar', or 'arxiv'."
     )

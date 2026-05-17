@@ -28,9 +28,11 @@ from typing import Callable, Sequence
 
 from .baselines import RankedResult, bm25, dense, ss_default
 from .citation_rerank import citation_rerank, citation_rerank_global
+from .cross_encoder_rerank import cross_encoder_rerank
 from .gold import GoldStage, grade_for, load_gold, normalize_title
 from .llm_rerank import get_backend, rerank as llm_rerank_fn
 from .retriever import Paper
+from .rrf_rerank import rrf
 from .sources import get_source, search
 
 logger = logging.getLogger(__name__)
@@ -100,13 +102,22 @@ def _is_labeled(gold: GoldStage, title: str) -> bool:
 
 
 def _build_rankers(
-    enable_llm: bool, enable_citation: bool
+    enable_llm: bool,
+    enable_citation: bool,
+    enable_cross: bool = True,
 ) -> dict[str, Callable[[str, list[Paper]], list[RankedResult]]]:
     rankers: dict[str, Callable[[str, list[Paper]], list[RankedResult]]] = {
         "ss_default": lambda q, ps: ss_default(ps),
         "bm25": lambda q, ps: bm25(q, ps),
         "dense": lambda q, ps: dense(q, ps),
+        "rrf(default+bm25+dense)": lambda q, ps: rrf({
+            "ss_default": ss_default(ps),
+            "bm25": bm25(q, ps),
+            "dense": dense(q, ps),
+        }),
     }
+    if enable_cross:
+        rankers["cross_encoder"] = lambda q, ps: cross_encoder_rerank(q, ps)
     if enable_llm:
         backend = get_backend()
 
@@ -129,8 +140,16 @@ def _build_rankers(
 
                 rankers["llm+citation(refs)"] = _llm_cite
             else:
-                # SerpAPI / sources without per-paper reference lists:
+                # SerpAPI / arXiv / sources without per-paper reference lists:
                 # fall back to global citation_count as the authority signal.
+                # Note: for arXiv, citation_count=0 for all papers, so the
+                # blend is a no-op and the result equals pure llm_rerank.
+                if source == "arxiv":
+                    logger.warning(
+                        "arXiv source has citation_count=0 for all papers; "
+                        "llm+citation(global) will be identical to llm_rerank."
+                    )
+
                 def _llm_cite_global(q: str, ps: list[Paper]) -> list[RankedResult]:
                     base = llm_rerank_fn(q, ps, backend=backend)
                     return citation_rerank_global(base, ps)
@@ -260,6 +279,11 @@ def main() -> None:
         help="Skip the citation-graph reranker (also skipped if --no-llm)",
     )
     parser.add_argument(
+        "--no-cross",
+        action="store_true",
+        help="Skip the cross-encoder reranker (skips model download on first run)",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=REPORTS_DIR / "q3_results.md",
@@ -277,6 +301,7 @@ def main() -> None:
     rankers = _build_rankers(
         enable_llm=not args.no_llm,
         enable_citation=not args.no_citation,
+        enable_cross=not args.no_cross,
     )
 
     all_rows: list[EvalRow] = []

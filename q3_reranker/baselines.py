@@ -104,7 +104,7 @@ def dense(
 def main() -> None:
     import argparse
 
-    from .retriever import search
+    from .sources import search
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
