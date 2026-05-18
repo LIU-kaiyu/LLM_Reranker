@@ -28,7 +28,14 @@ from pathlib import Path
 from .baselines import RankedResult
 from .eval import _build_rankers, mrr, ndcg_at_k, recall_at_k
 from .gold import GoldStage, gold_for_query, grade_for
-from .sources import search
+from .sources import get_source, search
+
+_SOURCE_LABELS = {
+    "arxiv": "arXiv",
+    "serpapi": "SerpAPI Google Scholar",
+    "semantic_scholar": "Semantic Scholar",
+    "ss": "Semantic Scholar",
+}
 
 
 def _title(r: RankedResult, max_len: int = 70) -> str:
@@ -131,9 +138,10 @@ def main() -> None:
     }
 
     gold = gold_for_query(args.query)
+    source_label = _SOURCE_LABELS.get(get_source(), get_source())
     print(
         f"\nQuery: {args.query!r}  "
-        f"({len(papers)} candidates from Semantic Scholar)\n"
+        f"({len(papers)} candidates from {source_label})\n"
     )
     _print_table(rankings, top_k=args.top_k, gold=gold)
 

@@ -27,12 +27,23 @@ from .baselines import RankedResult
 from .eval import _build_rankers
 from .gold import load_gold
 from .retriever import Paper
-from .sources import search
+from .sources import get_source, search
 
 logger = logging.getLogger(__name__)
 
 _LIMIT = 20  # fixed candidate pool; keeps latency and SerpAPI cost low
 _FAST = frozenset({"ss_default", "bm25", "dense"})
+
+_SOURCE_LABELS = {
+    "arxiv": "arXiv",
+    "serpapi": "SerpAPI Google Scholar",
+    "semantic_scholar": "Semantic Scholar",
+    "ss": "Semantic Scholar",
+}
+
+
+def _source_label() -> str:
+    return _SOURCE_LABELS.get(get_source(), get_source())
 
 # ---------------------------------------------------------------------------
 # In-memory job store (demo-scale; no persistence needed)
@@ -53,6 +64,28 @@ def _job_id(retrieval_query: str, nl_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _paper_url(p: Paper | None) -> str | None:
+    """Best-effort canonical URL for a paper.
+
+    Built only from validated id/DOI fields (never a raw API-supplied href)
+    so the value is safe to embed as an anchor target.
+    """
+    if p is None:
+        return None
+    ext = p.external_ids or {}
+    arxiv_id = ext.get("arxiv") or ext.get("ArXiv")
+    if arxiv_id:
+        # The arXiv Atom <id> is the abs page; versionless slug redirects
+        # to the latest revision.
+        return f"https://arxiv.org/abs/{arxiv_id}"
+    doi = ext.get("DOI") or ext.get("doi")
+    if doi:
+        return f"https://doi.org/{doi}"
+    if get_source() in ("semantic_scholar", "ss") and p.paper_id:
+        return f"https://www.semanticscholar.org/paper/{p.paper_id}"
+    return None
+
+
 def _enrich(r: RankedResult, papers_by_id: dict[str, Paper]) -> dict[str, Any]:
     p = papers_by_id.get(r.paper_id)
     return {
@@ -64,6 +97,7 @@ def _enrich(r: RankedResult, papers_by_id: dict[str, Paper]) -> dict[str, Any]:
         "authors": (p.authors[:3] if p else []),
         "citations": p.citation_count if p else 0,
         "abstract": ((p.abstract or "")[:220]) if p else "",
+        "url": _paper_url(p),
     }
 
 
@@ -135,7 +169,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/":
-            self._send_html(_HTML)
+            self._send_html(_HTML.replace("__SOURCE__", _source_label()))
         elif self.path == "/api/presets":
             self._send_json(self._presets)
         elif self.path.startswith("/api/llm/"):
@@ -268,6 +302,8 @@ td{padding:9px 11px;border-bottom:1px solid #f1f3f4;vertical-align:top}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#fafafa}
 .ptitle{font-weight:500;color:#1a0dab;line-height:1.4;max-width:400px}
+.ptitle a{color:inherit;text-decoration:none}
+.ptitle a:hover{text-decoration:underline}
 .pmeta{font-size:11px;color:#5f6368;margin-top:2px}
 .pabs{font-size:11px;color:#3c4043;margin-top:4px;line-height:1.5;max-width:400px}
 .rb{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;font-size:11px;font-weight:700}
@@ -295,7 +331,7 @@ th.sorted{color:#1a73e8}
 <body>
 <div class="hdr">
   <div class="hdr-logo">Reranker Demo</div>
-  <div class="hdr-sub">Semantic Scholar &middot; BM25 &middot; Dense &middot; LLM (DeepSeek) &middot; Citation Blend</div>
+  <div class="hdr-sub">__SOURCE__ &middot; BM25 &middot; Dense &middot; RRF &middot; Cross-encoder &middot; LLM rerank</div>
 </div>
 <div class="main">
   <div class="sec-title">Select a benchmark query</div>
@@ -481,7 +517,8 @@ th.sorted{color:#1a73e8}
         var d=compareMode?deltaHtml(pid,r):'';
         return '<td>'+badge(rk)+d+'</td>';
       }).join('');
-      return '<tr><td><div class="ptitle">'+esc(p.title)+'</div>'+(meta?'<div class="pmeta">'+esc(meta)+'</div>':'')+(p.abstract?'<div class="pabs">'+esc(p.abstract)+'</div>':'')+'</td>'+cells+'</tr>';
+      var titleInner=p.url?'<a href="'+esc(p.url)+'" target="_blank" rel="noopener noreferrer">'+esc(p.title)+'</a>':esc(p.title);
+      return '<tr><td><div class="ptitle">'+titleInner+'</div>'+(meta?'<div class="pmeta">'+esc(meta)+'</div>':'')+(p.abstract?'<div class="pabs">'+esc(p.abstract)+'</div>':'')+'</td>'+cells+'</tr>';
     }).join('');
     document.getElementById('results').style.display='block';
   }
