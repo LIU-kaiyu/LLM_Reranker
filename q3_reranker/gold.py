@@ -96,8 +96,19 @@ def grade_for(gold: GoldStage, title: str) -> int:
 
 def main() -> None:
     """Print a small summary of the loaded gold set."""
-    stages = load_gold()
-    print(f"Loaded {len(stages)} gold stages from {GOLD_PATH.name}\n")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Summarize a gold-label file.")
+    parser.add_argument(
+        "--path",
+        type=Path,
+        default=GOLD_PATH,
+        help="Gold-label JSON file to summarize",
+    )
+    args = parser.parse_args()
+
+    stages = load_gold(args.path)
+    print(f"Loaded {len(stages)} gold stages from {args.path}\n")
     for s in stages:
         total = len(s.papers)
         by_grade: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}

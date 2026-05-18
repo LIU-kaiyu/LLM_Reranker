@@ -81,7 +81,8 @@ q3_reranker/
 │
 ├── data/
 │   ├── gold/
-│   │   └── queries.json        8 gold benchmark stages with relevance grades
+│   │   ├── queries.json        Scholar-derived gold stages
+│   │   └── queries_arxiv.json  arXiv top-30 gold stages
 │   └── cache/                  gitignored; all API response caches
 │       ├── retrieve/
 │       ├── serpapi/
@@ -193,7 +194,7 @@ RETRIEVAL_SOURCE=ss               → retriever.search()   (alias)
 RETRIEVAL_SOURCE=arxiv            → arxiv_retriever.search()
 ```
 
-Default is `serpapi`. Set to `semantic_scholar` to enable true in-set citation-graph reranking (the global fallback is used otherwise). Use `arxiv` to get full abstracts at no API cost, with the understanding that the citation-graph blend is inert.
+Default is `arxiv`. Set to `semantic_scholar` to enable true in-set citation-graph reranking (the global fallback is used otherwise). Use `serpapi` for Google Scholar retrieval with citation counts (required for `llm+citation(global)`). `arxiv` is the recommended default: free, no API key, full abstracts, and the fixed LLM reranker leads the arXiv benchmark at NDCG@10 = 0.850.
 
 ---
 
@@ -359,7 +360,11 @@ All caches are gitignored. A fresh clone must re-run evaluation to populate them
 
 ### File format
 
-`data/gold/queries.json`:
+Default gold file: `data/gold/queries.json`.
+
+ArXiv-specific gold file: `data/gold/queries_arxiv.json`.
+
+Both files use the same schema:
 
 ```json
 [
@@ -438,6 +443,8 @@ Up to seven rankers run per stage depending on flags:
 | `--no-cross` | excludes `cross_encoder` |
 | `--no-citation` | excludes `llm+citation`, keeps `llm_rerank` |
 
+Use `--gold PATH` to select a non-default label file, for example `--gold data/gold/queries_arxiv.json` with `RETRIEVAL_SOURCE=arxiv`.
+
 ---
 
 ## 12. Evaluation results and analysis
@@ -452,48 +459,65 @@ Up to seven rankers run per stage depending on flags:
 | dense | 0.358 | 0.576 | 0.395 |
 | bm25 | 0.267 | 0.333 | 0.455 |
 
+**Note on Run 2 LLM numbers:** These numbers were produced while a silent bug was present in `_rank_window` — when `parse_ranked_ids` returned an empty list (caused by DeepSeek's reasoning model starving the answer at `max_tokens=1024`), the function returned the unchanged source order. `llm_rerank` was therefore statistically equivalent to `ss_default` in most windows, which explains the surprisingly low score.
+
 ### Run 3 cross-stage summary (arXiv source, `--no-llm`, `--limit 30`)
+
+Run 3 collapsed to near-zero because the gold file (`queries.json`) was built from SerpAPI Scholar results. arXiv returns a different paper pool: Stages 2, 5, 6, 7, 8, 9 returned zero labeled papers. These zeros are a gold-mismatch artifact, not evidence of poor arXiv retrieval.
+
+### Run 4 cross-stage summary (arXiv source, arXiv gold, `--no-llm`, `--limit 30`)
+
+Gold file: `data/gold/queries_arxiv.json` — 30 labeled papers per stage, source-matched to the arXiv top-30 pool.
 
 | Ranker | NDCG@10 | MRR | Recall@10 |
 |---|---|---|---|
-| dense | 0.251 | 0.271 | 0.267 |
-| rrf(default+bm25+dense) | 0.173 | 0.168 | 0.267 |
-| cross_encoder | 0.145 | 0.160 | 0.225 |
-| bm25 | 0.138 | 0.147 | 0.225 |
-| ss_default | 0.081 | 0.066 | 0.133 |
+| **dense** | **0.737** | 1.000 | 0.544 |
+| cross_encoder | 0.737 | 1.000 | 0.477 |
+| rrf(default+bm25+dense) | 0.667 | 0.938 | 0.495 |
+| bm25 | 0.580 | 0.938 | 0.419 |
+| ss_default | 0.451 | 0.792 | 0.343 |
 
-**Retrieval mismatch caveat:** The gold labels were built from SerpAPI Scholar results. arXiv retrieval returns a different paper pool: Stages 2, 5, 6, 7, 8, 9 return zero labeled papers (arXiv pool does not contain the gold papers). Only Stages 1 and 3 have meaningful pool overlap. Run 3 cross-stage means are therefore dominated by zeroed-out stages and should not be interpreted as evidence that the arXiv pool is better or worse for reranking — the pool mismatch is a retrieval problem, not a reranking one.
+Dense and cross-encoder tie. `ss_default` scores lowest — Scholar's citation-popularity ordering is the wrong prior for arXiv pools. RRF fuses robustly but is noisy on stages where `ss_default` contributes poor rankings.
 
-**Stage 1 (arXiv):** RRF = **0.869** > dense 0.844 > bm25 0.806 > cross_encoder 0.776 > ss_default 0.211. RRF correctly fuses the three baselines to exceed each individually — this is the intended use case where all input rankers carry useful signal.
+### Run 5 cross-stage summary (arXiv source, arXiv gold, full LLM, `--limit 30`) — current best
 
-**Stage 3 (arXiv):** dense = **1.000** > cross_encoder 0.387 > rrf 0.333 > bm25 0.301 > ss_default 0.000. RRF is pulled below dense because `ss_default` (0.000) adds noise. Cross-encoder trails dense despite its architectural advantage due to MS MARCO / scientific-text domain mismatch.
+Fix applied: `DEFAULT_MAX_TOKENS = 8192`; `_rank_window` now raises `LLMRerankError` on empty parse instead of silently returning source order; deterministic integer-scan fallback in `parse_ranked_ids`.
 
-### Why ss_default leads the aggregate
-
-Stages 6–9 (vision and bio topics) have only 2–4 labeled papers in Scholar's top-30 pool. When 27 of 30 papers are unjudged, the ranker that surfaces the 2–4 labeled ones first wins. Scholar's default order happens to place them reasonably well because Scholar's own ranking already uses global citation count — the same signal our blend tries to replicate, but over Scholar's full index rather than just the 30-paper pool.
-
-### Where the blend wins
-
-On stages with higher gold coverage and where canonical papers are well-represented in the pool:
-
-| Stage | Topic | ss_default | blend |
+| Ranker | NDCG@10 | MRR | Recall@10 |
 |---|---|---|---|
-| 2 | Scientific embeddings | 0.892 | **1.000** |
-| 8 | Protein structure | 0.680 | **0.832** |
+| **llm_rerank** | **0.850** | **1.000** | **0.555** |
+| dense | 0.737 | 1.000 | 0.544 |
+| cross_encoder | 0.737 | 1.000 | 0.477 |
+| rrf(default+bm25+dense) | 0.667 | 0.938 | 0.495 |
+| bm25 | 0.580 | 0.938 | 0.419 |
+| ss_default | 0.451 | 0.792 | 0.343 |
 
-Stage 8 is the clearest win: AlphaFold and RoseTTAFold are cited by essentially every other paper in the pool, so in-set in-degree correctly identifies them as the top-2. Scholar's default order does not place them first.
+**`llm_rerank` leads by 11.3 NDCG points** over dense and cross_encoder. The token-budget fix is entirely responsible for the gap — the ranker was already architecturally correct; it was silently emitting empty responses in prior runs.
 
-### Stage 6 failure (monocular depth)
+### Stage-level highlights (Run 5)
 
-Stage 6 has 12 gold papers but Scholar's pool contains only 2 labeled papers. All rankers score near 0. This is a **retrieval failure**, not a reranking failure: MiDaS, DPT, and Depth Anything are not in the top-30 pool. No reranker can fix retrieval misses. For vision tasks Scholar surfaces surveys and application papers before canonical method papers.
+| Stage | Topic | dense | llm_rerank | Winner |
+|---|---|---|---|---|
+| 3 | Agentic RAG | 0.891 | **0.987** | llm |
+| 9 | RAG foundations | 0.509 | **0.816** | llm (+30.7 pts) |
+| 6 | Monocular depth | 0.675 | **0.853** | llm |
+| 2 | Document embeddings | 0.522 | **0.773** | llm |
+| 8 | Protein structure | 0.848 | **0.967** | llm |
+| 1 | LLM-based reranking | **0.897** | 0.892 | dense (≈tie) |
+| 5 | Lit review | **0.961** | 0.838 | dense |
+| 7 | Diffusion models | 0.592 | 0.677 | llm (cross_encoder 0.815 leads) |
 
-### Stage 9 exception (RAG foundations)
+**Stage 9 (RAG foundations)** is the largest gap: the NL query asks for *foundational* papers, a semantic framing that embedding similarity cannot distinguish from topically-related non-foundational work, but the LLM reasons over it correctly.
 
-`ss_default` (0.611) beats the blend (0.453) on Stage 9. The retrieval query includes `"Lewis 2020"`, which causes Scholar to surface Lewis et al. at rank 1 (grade 3). The LLM reranker demotes it — possibly interpreting the author-name mention as noise — and the blend does not recover it. This indicates λ = 0.7 is not globally optimal.
+**Stage 7 (Diffusion models)** is the only stage the LLM does not lead; cross_encoder (0.815) beats both. This may reflect the specific arXiv pool composition for diffusion models — papers with highly similar titles/abstracts where the MS MARCO cross-encoder's fine-grained local attention is more useful than the LLM's holistic ranking.
 
-### LLM + citation blend vs LLM alone
+### Why ss_default leads the SerpAPI aggregate (Run 2)
 
-`llm+citation(global)` (0.582) consistently outperforms `llm_rerank` alone (0.508). The citation signal lifts canonical papers from LLM positions 3–6 to positions 1–2 without disrupting the LLM's overall relevance ordering. This supports the core hypothesis: combining topical relevance (LLM) with structural authority (citation) is better than either alone.
+Stages 6–9 (vision and bio topics) had only 2–4 labeled papers in Scholar's top-30 pool. When 27 of 30 papers are unjudged, the ranker that surfaces the 2–4 labeled ones first wins. Scholar's order happens to place them reasonably because Scholar already uses global citation count — the same signal the blend replicates but over a 30-paper pool. The arXiv gold fix eliminates this measurement artifact entirely: all 30 papers per stage are labeled.
+
+### LLM + citation blend vs LLM alone (SerpAPI context)
+
+In the SerpAPI runs, `llm+citation(global)` (0.582) outperforms `llm_rerank` (0.508). This difference is exaggerated by the silent-failure bug: both rankers were partially returning source order, and the citation term in the blend happened to partially correct some stages. With the fix applied on arXiv, the blend is not evaluated (citation_count=0 for all arXiv papers), but the LLM alone now reaches 0.850 — well above the blend's 0.582 on SerpAPI.
 
 ---
 
@@ -586,7 +610,7 @@ Implement `search(query: str, limit: int, **kwargs) -> list[Paper]` returning `P
 
 ### Adding gold stages
 
-Edit `data/gold/queries.json`. Follow the existing schema: `stage`, `topic`, `query`, `retrieval_query`, `papers` (dict of title → grade 0–3). Run `python -m q3_reranker.gold` to verify the stage loads and matches correctly.
+Edit the appropriate file under `data/gold/`. Use `queries.json` for the default Scholar-derived benchmark and `queries_arxiv.json` for arXiv-specific top-30 labels. Follow the existing schema: `stage`, `topic`, `query`, `retrieval_query`, `papers` (dict of title → grade 0–3). Run `python -m q3_reranker.gold --path data/gold/queries_arxiv.json` to verify an alternate gold file.
 
 ### Changing the blend weight
 

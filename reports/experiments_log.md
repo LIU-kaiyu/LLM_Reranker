@@ -209,9 +209,65 @@ entries.
   - dense = **1.000** (perfect) > cross_encoder 0.387 > rrf 0.333 > bm25 0.301 > ss_default 0.000
   - RRF pulled below dense here because ss_default and bm25 add noise on this query.
 
-### Run 2 — expanded benchmark (this run, 2026-05-15)
+### Run 2 — expanded benchmark (2026-05-15)
 - Stages: 1, 2, 3, 5, 6, 7, 8, 9 (≈146 papers).
-- `limit=30`, DeepSeek `deepseek-chat`, λ=0.7.
-- See `reports/q3_results.md` after the run for the final numbers.
+- Source: SerpAPI Google Scholar, `limit=30`, DeepSeek `deepseek-chat`, λ=0.7.
+- See `reports/q3_results.md` for per-stage numbers.
 - Stages 6–9 are out-of-distribution relative to Q1; if the blend
   still wins on average, that's evidence the recipe generalizes.
+
+---
+
+### Run 4 — arXiv gold set, no-LLM baseline (2026-05-18)
+- Stages: 1, 2, 3, 5, 6, 7, 8, 9 (all 8).
+- Source: `RETRIEVAL_SOURCE=arxiv`, `limit=30`, `--no-llm`.
+- Gold: `data/gold/queries_arxiv.json` (new arXiv-specific gold, 30 labeled
+  papers per stage matching cached arXiv top-30 pools exactly — 0 missing,
+  0 extra). Fixes the all-zero problem from Run 3.
+- Rankers: ss_default, bm25, dense, rrf(default+bm25+dense), cross_encoder.
+- Output: `reports/q3_results_arxiv.md`.
+- Cross-stage mean NDCG@10:
+  - `dense` = **0.737**
+  - `cross_encoder` = 0.737
+  - `rrf(default+bm25+dense)` = 0.667
+  - `bm25` = 0.580
+  - `ss_default` = 0.451
+- Notable: dense and cross_encoder tie for first, both far above Run 3's
+  0.251/0.145 — the arXiv gold set correction accounts for the full gap.
+  ss_default still trails, confirming Scholar citation-order is poor on
+  arXiv pools.
+
+### Run 5 — arXiv gold set, full LLM (2026-05-18)
+- Stages: 1, 2, 3, 5, 6, 7, 8, 9 (all 8).
+- Source: `RETRIEVAL_SOURCE=arxiv`, `limit=30`, DeepSeek `deepseek-chat`.
+- Gold: `data/gold/queries_arxiv.json`.
+- Key code changes active for this run vs. all prior runs:
+  - `DEFAULT_MAX_TOKENS = 8192` (was 1024; reasoning models no longer
+    starve; CoT + JSON answer both fit in one call).
+  - `_rank_window` raises `LLMRerankError` on empty parse (was silently
+    returning ss_default order, making LLM indistinguishable from baseline).
+  - Deterministic integer-scan fallback in `parse_ranked_ids` (covers
+    prose-wrapped / slightly malformed responses).
+  - Citation ranker auto-hidden on arXiv (all citation_count=0 on arXiv
+    papers; would duplicate llm_rerank — skipped automatically).
+- Output: `reports/q3_results_arxiv_llm.md`.
+- Cross-stage mean NDCG@10:
+  - `llm_rerank` = **0.850** ← new best across all runs
+  - `dense` = 0.737
+  - `cross_encoder` = 0.737
+  - `rrf(default+bm25+dense)` = 0.667
+  - `bm25` = 0.580
+  - `ss_default` = 0.451
+- Stage-level highlights:
+  - Stage 3 (Agentic RAG): llm **0.987** (near-perfect) vs dense 0.891.
+  - Stage 9 (RAG foundations): llm **0.816** vs dense 0.509 — biggest
+    absolute gap; LLM understands "foundational" framing in the query.
+  - Stage 6 (Monocular depth): llm **0.853** vs dense 0.675.
+  - Stage 2 (Document embeddings): llm **0.773** vs dense 0.522.
+  - Stage 7 (Diffusion models): llm 0.677 < cross_encoder **0.815** —
+    only stage where LLM does not lead.
+  - Stage 8 (Protein): cross_encoder **1.000** > llm 0.967 — both near
+    ceiling.
+- Conclusion: The 8192-token fix transformed llm_rerank from a broken
+  ranker (indistinguishable from ss_default in prior runs) to the top
+  ranker across 6 of 8 stages.

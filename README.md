@@ -90,16 +90,22 @@ cp .env.example .env
 ### 3. Run the evaluation (cached — free after first run)
 
 ```bash
-# Cheap smoke run with no LLM calls:
-python -m q3_reranker.eval --no-llm
+# Recommended: arXiv source + arXiv gold + full LLM (Run 5 — cached):
+RETRIEVAL_SOURCE=arxiv python -m q3_reranker.eval \
+    --gold data/gold/queries_arxiv.json \
+    --out reports/q3_results_arxiv_llm.md
 
-# Full run (all 5 rankers, all 8 stages):
+# Smoke run (no LLM calls, arXiv source):
+RETRIEVAL_SOURCE=arxiv python -m q3_reranker.eval \
+    --gold data/gold/queries_arxiv.json \
+    --no-llm \
+    --out reports/q3_results_arxiv.md
+
+# SerpAPI source, all 8 stages (requires SERPAPI_KEY or cached data):
 python -m q3_reranker.eval
 
 # Single stage only:
 python -m q3_reranker.eval --stage 3
-
-# Results written to: reports/q3_results.md
 ```
 
 ### 4. Browser demo
@@ -117,7 +123,7 @@ python -m q3_reranker.web_demo --port 8080
 |---|---|---|---|
 | `RERANKER_BACKEND` | no | `claude` | LLM backend: `claude` or `deepseek` |
 | `RERANKER_MODEL` | no | backend default | Override the specific model name |
-| `RETRIEVAL_SOURCE` | no | `serpapi` | `serpapi`, `semantic_scholar`, or `arxiv` |
+| `RETRIEVAL_SOURCE` | no | `arxiv` | `serpapi`, `semantic_scholar`, or `arxiv` |
 | `ANTHROPIC_API_KEY` | if using Claude | — | Anthropic API key |
 | `DEEPSEEK_API_KEY` | if using DeepSeek | — | DeepSeek API key |
 | `SERPAPI_KEY` | if using SerpAPI | — | SerpAPI key |
@@ -139,8 +145,8 @@ All variables are loaded from `.env` automatically when using any module's `main
 | `rrf_rerank.py` | 2 | Reciprocal Rank Fusion ensemble: fuses ranked lists from multiple rankers using `score(d) = Σ 1/(60 + rank)`. No model or API required. |
 | `cross_encoder_rerank.py` | 2 | Cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-12-v2`, ~33 MB). Full attention over `(query, title+abstract)` pairs; faster than LLM, no API key. |
 | `llm_rerank.py` | 3 | RankGPT-style sliding-window listwise reranker. Pluggable backends (`AnthropicBackend`, `DeepSeekBackend`). LLM response cache under `data/cache/llm/`. |
-| `gold.py` | 4 | Loads `data/gold/queries.json`. Parses relevance grades 0–3. Fuzzy title normalisation for matching retrieved papers against hand-labeled gold. |
-| `eval.py` | 4 | Orchestrates all rankers over all gold stages. Computes NDCG@10, MRR, Recall@10. Writes `reports/q3_results.md`. |
+| `gold.py` | 4 | Loads gold-label JSON files (`data/gold/queries.json` by default; `queries_arxiv.json` for arXiv). Parses relevance grades 0–3. Fuzzy title normalisation for matching retrieved papers against hand-labeled gold. |
+| `eval.py` | 4 | Orchestrates all rankers over all gold stages. Computes NDCG@10, MRR, Recall@10. Writes `reports/q3_results.md` by default. |
 | `citation_rerank.py` | 6 | Novel angle. `citation_rerank`: in-set graph via SS batch API (requires `semantic_scholar` source). `citation_rerank_global`: log1p-normalised global citation count fallback for SerpAPI. |
 | `demo.py` | 5 | CLI: column-aligned side-by-side top-K comparison table. |
 | `web_demo.py` | 6 | Browser-based demo. Pure Python stdlib HTTP server (`ThreadingHTTPServer`). Two-phase response: fast rankers sync, LLM rankers via background thread + client polling. |
@@ -216,8 +222,10 @@ python -m q3_reranker.demo \
 ### Full evaluation
 
 ```bash
-python -m q3_reranker.eval [--no-llm] [--no-citation] [--no-cross] [--stage N] [--limit 30]
+python -m q3_reranker.eval [--gold PATH] [--no-llm] [--no-citation] [--no-cross] [--stage N] [--limit 30]
 ```
+
+`--gold` selects the label file. Use `data/gold/queries_arxiv.json` when `RETRIEVAL_SOURCE=arxiv`.
 
 `--no-cross` skips downloading and running the cross-encoder model (saves ~33 MB on first run and ~0.5 s per stage).
 
@@ -265,9 +273,38 @@ Only preset chips are shown — no free-text search box — so no SerpAPI credit
 
 ## Evaluation results
 
+### Run 5 — arXiv source, full LLM, arXiv gold (2026-05-18) — **current best**
+
+Cross-stage mean over all 8 stages (`RETRIEVAL_SOURCE=arxiv`, `--limit 30`,
+gold: `data/gold/queries_arxiv.json`):
+
+| Ranker | NDCG@10 | MRR | Recall@10 |
+|---|---|---|---|
+| **llm_rerank** | **0.850** | **1.000** | **0.555** |
+| dense | 0.737 | 1.000 | 0.544 |
+| cross_encoder | 0.737 | 1.000 | 0.477 |
+| rrf(default+bm25+dense) | 0.667 | 0.938 | 0.495 |
+| bm25 | 0.580 | 0.938 | 0.419 |
+| ss_default | 0.451 | 0.792 | 0.343 |
+
+**Key finding:** `llm_rerank` leads by 11 NDCG points. The improvement over prior LLM runs stems from fixing `DEFAULT_MAX_TOKENS` from 1024 → 8192 (DeepSeek reasoning models were emitting empty content after an internal chain-of-thought that consumed the budget), and raising `LLMRerankError` on empty parse instead of silently returning source order. Stage 3 (agentic RAG) = **0.987**; Stage 9 (RAG foundations) = **0.816** vs dense 0.509 — the largest single-stage gap.
+
+### Run 4 — arXiv source, no-LLM, arXiv gold (2026-05-18)
+
+| Ranker | NDCG@10 | MRR | Recall@10 |
+|---|---|---|---|
+| **dense** | **0.737** | 1.000 | 0.544 |
+| cross_encoder | 0.737 | 1.000 | 0.477 |
+| rrf(default+bm25+dense) | 0.667 | 0.938 | 0.495 |
+| bm25 | 0.580 | 0.938 | 0.419 |
+| ss_default | 0.451 | 0.792 | 0.343 |
+
+The arXiv gold fix (source-matched labels, 30 per stage) corrects the all-zero
+Run 3 scores which were a gold-mismatch artifact, not poor retrieval.
+
 ### Run 2 — SerpAPI source, 5 rankers (2026-05-15)
 
-Cross-stage mean over all 8 benchmark stages (`--limit 30`, SerpAPI):
+Cross-stage mean (`--limit 30`, SerpAPI, `data/gold/queries.json`):
 
 | Ranker | NDCG@10 | MRR | Recall@10 |
 |---|---|---|---|
@@ -277,25 +314,10 @@ Cross-stage mean over all 8 benchmark stages (`--limit 30`, SerpAPI):
 | dense | 0.358 | 0.576 | 0.395 |
 | bm25 | 0.267 | 0.333 | 0.455 |
 
-**Key finding:** `ss_default` leads on the cross-stage mean because Stages 6–9 (vision and bio topics) have only 2–4 labeled papers in Scholar's top-30 pool. When gold coverage is this sparse, whichever order the source returns is hard to beat by reranking. The citation blend wins decisively on stages with denser gold coverage — e.g., Stage 8 (protein structure): blend NDCG@10 = **0.832** vs ss_default 0.680.
-
-### Run 3 — arXiv source, 5 rankers + RRF + cross-encoder (2026-05-16)
-
-Cross-stage mean (`--limit 30`, `--no-llm`, `RETRIEVAL_SOURCE=arxiv`):
-
-| Ranker | NDCG@10 | MRR | Recall@10 |
-|---|---|---|---|
-| **dense** | **0.251** | **0.271** | **0.267** |
-| rrf(default+bm25+dense) | 0.173 | 0.168 | 0.267 |
-| cross_encoder | 0.145 | 0.160 | 0.225 |
-| bm25 | 0.138 | 0.147 | 0.225 |
-| ss_default | 0.081 | 0.066 | 0.133 |
-
-**Context:** arXiv retrieval returns a different paper pool than SerpAPI; the gold labels (built from SerpAPI) are mostly absent from the arXiv pool. Stages 2, 5, 6, 7, 8, 9 return zero labeled papers — all zeros are retrieval misses, not reranking failures. Stages 1 and 3 have pool overlap and show meaningful results: Stage 1 RRF = **0.869** NDCG@10 (best), Stage 3 dense = **1.000** (perfect).
-
-The cross-encoder underperforms dense on scientific text because `ms-marco-MiniLM-L-12-v2` was trained on web passages, not academic abstracts. RRF successfully fuses the three baselines on Stage 1 (outperforming all individual rankers) but is pulled below dense on Stage 3 where `ss_default` adds noise.
-
-Full per-stage breakdown: `reports/q3_results.md`. Experimental record: `reports/experiments_log.md`.
+`ss_default` leads here because Stages 6–9 had only 2–4 gold papers in Scholar's
+top-30 (retrieval coverage bottleneck, not a reranking result). The `llm_rerank`
+score of 0.508 also reflects the now-fixed silent-failure bug. Full per-stage
+breakdown: `reports/q3_results.md`. Experimental record: `reports/experiments_log.md`.
 
 ---
 
@@ -330,6 +352,9 @@ Stages 1–5 are derived from Q1 analyst labels. Stages 6–9 were hand-encoded 
 - [x] Phase 8 — RRF ensemble (`rrf_rerank.py`): fuses ss_default + bm25 + dense via Reciprocal Rank Fusion
 - [x] Phase 8 — cross-encoder reranker (`cross_encoder_rerank.py`): full-attention scoring, no API key required
 - [x] Phase 8 — arXiv retrieval source (`arxiv_retriever.py`): free, full abstracts, no API key
+- [x] Phase 9 — arXiv gold set (`data/gold/queries_arxiv.json`): 30 source-matched labels per stage; `--gold PATH` eval flag; `--path` gold validator flag
+- [x] Phase 9 — LLM silent-failure fix: `max_tokens=8192`, `LLMRerankError` on empty parse, deterministic integer-scan fallback; `llm_rerank` now leads at NDCG@10 = 0.850
+- [x] Phase 9 — web demo: arXiv 429 resilience, single `render()` SPA rewrite (fixes empty LLM column bug), per-column sort + compare mode, paper hyperlinks, dynamic source label
 
 ## Context files
 
@@ -338,5 +363,7 @@ Stages 1–5 are derived from Q1 analyst labels. Stages 6–9 were hand-encoded 
 | `/home/kaiyul3/ASAT/comparison_report.md` | Q1 Asta evaluation; source of gold labels for Stages 1–5 |
 | `/home/kaiyul3/ASAT/observation.tex` | Q2 deep-dive into how Asta's paper finder works internally |
 | `/home/kaiyul3/ASAT/q3.tex` | Full Q3 written report (LaTeX) |
-| `reports/experiments_log.md` | Experimental record: gold construction, run parameters, findings |
-| `reports/q3_results.md` | Auto-generated evaluation table (overwritten each eval run) |
+| `reports/experiments_log.md` | Experimental record: gold construction, run parameters, findings (all 5 runs) |
+| `reports/q3_results.md` | SerpAPI eval table (Run 2) |
+| `reports/q3_results_arxiv.md` | arXiv no-LLM eval table (Run 4) |
+| `reports/q3_results_arxiv_llm.md` | arXiv full LLM eval table (Run 5) — current best |
