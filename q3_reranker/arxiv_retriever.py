@@ -54,6 +54,14 @@ _ARXIV_NS = "http://arxiv.org/schemas/atom"
 _NS = {"a": _ATOM, "arxiv": _ARXIV_NS}
 
 
+class ArxivRateLimitError(RuntimeError):
+    """Raised when arXiv keeps rate-limiting after the retry budget is spent.
+
+    Callers (e.g. the web demo) should catch this and surface a readable
+    'try again shortly' message instead of crashing the request.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -164,6 +172,10 @@ def _dict_to_paper(d: dict[str, Any]) -> Paper:
 # ---------------------------------------------------------------------------
 
 
+_MAX_ATTEMPTS = 3
+_BACKOFF_BASE_S = 3  # 3s → 6s → 12s
+
+
 def _fetch(query: str, limit: int) -> list[dict[str, Any]]:
     params = {
         "search_query": f"all:{query}",
@@ -172,13 +184,44 @@ def _fetch(query: str, limit: int) -> list[dict[str, Any]]:
         "sortBy": "relevance",
         "sortOrder": "descending",
     }
-    resp = requests.get(ARXIV_API_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    time.sleep(1)  # arXiv polite-pool courtesy delay
 
-    root = ET.fromstring(resp.content)
-    entries = root.findall("a:entry", namespaces=_NS)
-    return [_entry_to_dict(e) for e in entries]
+    last_status: int | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        # Courtesy delay BEFORE the call so bursts don't trip arXiv's limiter.
+        time.sleep(1)
+        resp = requests.get(ARXIV_API_URL, params=params, timeout=30)
+
+        if resp.status_code == 200:
+            root = ET.fromstring(resp.content)
+            entries = root.findall("a:entry", namespaces=_NS)
+            return [_entry_to_dict(e) for e in entries]
+
+        last_status = resp.status_code
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            if attempt == _MAX_ATTEMPTS - 1:
+                break
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else _BACKOFF_BASE_S * (2**attempt)
+            except ValueError:
+                wait = _BACKOFF_BASE_S * (2**attempt)
+            logger.warning(
+                "arXiv returned %d (attempt %d/%d); retrying in %.0fs",
+                resp.status_code,
+                attempt + 1,
+                _MAX_ATTEMPTS,
+                wait,
+            )
+            time.sleep(wait)
+            continue
+        # Non-retryable HTTP error.
+        resp.raise_for_status()
+
+    raise ArxivRateLimitError(
+        f"arXiv is rate-limiting requests (last status {last_status}) and did "
+        f"not recover after {_MAX_ATTEMPTS} attempts. Try again in a minute, "
+        f"or use a cached query."
+    )
 
 
 # ---------------------------------------------------------------------------

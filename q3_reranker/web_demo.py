@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .arxiv_retriever import ArxivRateLimitError
 from .baselines import RankedResult
 from .eval import _build_rankers
 from .gold import load_gold
@@ -171,18 +172,32 @@ class _Handler(BaseHTTPRequestHandler):
         retrieval_query: str = preset["retrieval_query"]
         nl_query: str = preset["query"]
 
-        papers = search(retrieval_query, limit=_LIMIT)
+        try:
+            papers = search(retrieval_query, limit=_LIMIT)
+        except ArxivRateLimitError as exc:
+            self._send_json({"error": str(exc)}, 503)
+            return
+        except Exception as exc:  # noqa: BLE001 - demo must not crash the thread
+            logger.error("Retrieval failed: %s", exc, exc_info=True)
+            self._send_json({"error": f"Retrieval failed: {exc}"}, 503)
+            return
+
         if not papers:
             self._send_json({"error": "No papers found."}, 404)
             return
 
         papers_by_id = {p.paper_id: p for p in papers}
 
-        fast_rankings: dict[str, list[RankedResult]] = {
-            name: ranker(nl_query, papers)
-            for name, ranker in self._all_rankers.items()
-            if name in _FAST
-        }
+        try:
+            fast_rankings: dict[str, list[RankedResult]] = {
+                name: ranker(nl_query, papers)
+                for name, ranker in self._all_rankers.items()
+                if name in _FAST
+            }
+        except Exception as exc:  # noqa: BLE001 - demo must not crash the thread
+            logger.error("Fast ranking failed: %s", exc, exc_info=True)
+            self._send_json({"error": f"Ranking failed: {exc}"}, 503)
+            return
         llm_rankers = {
             k: v for k, v in self._all_rankers.items()
             if k not in _FAST
@@ -262,6 +277,19 @@ tr:hover td{background:#fafafa}
 .rb-na{background:#f1f3f4;color:#9aa0a6;font-size:13px}
 .pend{color:#9aa0a6;font-size:11px}
 .err{color:#d93025;font-size:11px}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:#1a73e8}
+th.sorted{color:#1a73e8}
+.caret{font-size:9px;margin-left:4px}
+.delta{font-size:10px;font-weight:700;margin-left:5px}
+.d-up{color:#1e8e3e}
+.d-dn{color:#d93025}
+.d-eq{color:#9aa0a6}
+.d-new{color:#1a73e8}
+.controls{display:flex;align-items:center;gap:16px;margin:8px 0 12px;font-size:12px;color:#5f6368}
+.cmp-toggle{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+.hint{color:#9aa0a6}
+#errbox{display:none;padding:14px 16px;background:#fce8e6;color:#c5221f;border:1px solid #f5c2c0;border-radius:8px;margin-bottom:14px;font-size:13px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -273,10 +301,15 @@ tr:hover td{background:#fafafa}
   <div class="sec-title">Select a benchmark query</div>
   <div class="chips" id="chips"></div>
   <div id="loading"><div class="spin"></div>Retrieving papers&hellip;</div>
+  <div id="errbox"></div>
   <div id="results">
     <div class="res-hdr">
       <div class="res-query" id="res-query"></div>
       <div class="res-meta" id="res-meta"></div>
+    </div>
+    <div class="controls">
+      <label class="cmp-toggle"><input type="checkbox" id="cmp-chk"> Compare vs ss_default</label>
+      <span class="hint">Click a ranker column to sort &middot; click again to reverse &middot; click "Paper" to reset</span>
     </div>
     <div id="llm-notice"></div>
     <div class="tbl-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
@@ -285,14 +318,26 @@ tr:hover td{background:#fafafa}
 <script>
 (function(){
   var presets=[],allPapers={},paperRanks={},rankerOrder=[],currentJob=null,pollT=null;
+  var sortCol=null,sortDir=1,compareMode=false,pendingLlm=false,curQuery='',curN=0;
 
   function esc(s){
     return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
-  function rb(rank){
+  function badge(rank){
     if(!rank)return '<span class="rb rb-na">&mdash;</span>';
     var c=rank===1?'rb-1':rank<=3?'rb-top':'rb-ok';
     return '<span class="rb '+c+'">'+rank+'</span>';
+  }
+  function deltaHtml(pid,ranker){
+    if(ranker==='ss_default')return '';
+    var pr=paperRanks[pid]||{};
+    var base=pr['ss_default'],r=pr[ranker];
+    if(!r)return '';
+    if(!base)return '<span class="delta d-new">new</span>';
+    var d=base-r;
+    if(d>0)return '<span class="delta d-up">&#9650;'+d+'</span>';
+    if(d<0)return '<span class="delta d-dn">&#9660;'+(-d)+'</span>';
+    return '<span class="delta d-eq">=</span>';
   }
 
   fetch('/api/presets').then(function(r){return r.json();}).then(function(data){
@@ -307,11 +352,26 @@ tr:hover td{background:#fafafa}
     });
   });
 
+  document.getElementById('cmp-chk').addEventListener('change',function(e){
+    compareMode=e.target.checked;render();
+  });
+
+  function showErr(msg){
+    var b=document.getElementById('errbox');
+    b.textContent=msg;b.style.display='block';
+  }
+  function clearErr(){
+    var b=document.getElementById('errbox');
+    b.style.display='none';b.textContent='';
+  }
+
   function selectPreset(idx,btn){
     document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active');});
     btn.classList.add('active');
     if(pollT){clearInterval(pollT);pollT=null;}
     currentJob=null;allPapers={};paperRanks={};rankerOrder=[];
+    sortCol=null;sortDir=1;pendingLlm=false;
+    clearErr();
     document.getElementById('results').style.display='none';
     document.getElementById('loading').style.display='block';
     fetch('/api/search',{
@@ -320,27 +380,40 @@ tr:hover td{background:#fafafa}
       body:JSON.stringify({preset_idx:idx})
     }).then(function(r){return r.json();}).then(function(d){
       document.getElementById('loading').style.display='none';
-      if(d.error){alert('Error: '+d.error);return;}
-      currentJob=d.job_id;
-      renderTable(d.query,d.n_candidates,d.fast_rankings,d.has_llm,d.llm_rankings||null);
-      if(d.has_llm&&!d.llm_rankings){
-        setNotice(true);
-        pollT=setInterval(pollLlm,2500);
+      if(d.error){showErr(d.error);return;}
+      currentJob=d.job_id;curQuery=d.query;curN=d.n_candidates;
+      rankerOrder=Object.keys(d.fast_rankings);
+      ingest(d.fast_rankings);
+      if(d.llm_rankings){
+        addRankers(d.llm_rankings);ingest(d.llm_rankings);pendingLlm=false;
+      }else if(d.has_llm){
+        pendingLlm=true;pollT=setInterval(pollLlm,2500);
       }
+      render();
     }).catch(function(e){
       document.getElementById('loading').style.display='none';
-      alert('Request failed: '+e);
+      showErr('Request failed: '+e);
     });
   }
 
   function pollLlm(){
     if(!currentJob)return;
     fetch('/api/llm/'+currentJob).then(function(r){return r.json();}).then(function(d){
-      if(d.status==='done'){clearInterval(pollT);pollT=null;mergeLlm(d.rankings);}
-      else if(d.status==='error'){clearInterval(pollT);pollT=null;showErr(d.error);}
+      if(d.status==='done'){
+        clearInterval(pollT);pollT=null;pendingLlm=false;
+        addRankers(d.rankings);ingest(d.rankings);render();
+      }else if(d.status==='error'){
+        clearInterval(pollT);pollT=null;pendingLlm=false;
+        showErr('LLM rerank failed: '+d.error);render();
+      }
     });
   }
 
+  function addRankers(rankings){
+    Object.keys(rankings).forEach(function(r){
+      if(rankerOrder.indexOf(r)<0)rankerOrder.push(r);
+    });
+  }
   function ingest(rankings){
     Object.keys(rankings).forEach(function(ranker){
       rankings[ranker].forEach(function(p,i){
@@ -351,81 +424,25 @@ tr:hover td{background:#fafafa}
     });
   }
 
-  function sorted(){
+  function orderedIds(){
+    var key=sortCol||'ss_default';
     var ids=Object.keys(allPapers);
     ids.sort(function(a,b){
-      return (paperRanks[a]['ss_default']||999)-(paperRanks[b]['ss_default']||999);
+      var ra=(paperRanks[a]&&paperRanks[a][key])||9999;
+      var rbk=(paperRanks[b]&&paperRanks[b][key])||9999;
+      if(ra!==rbk)return (ra-rbk)*(sortCol?sortDir:1);
+      var sa=(paperRanks[a]&&paperRanks[a]['ss_default'])||9999;
+      var sb=(paperRanks[b]&&paperRanks[b]['ss_default'])||9999;
+      return sa-sb;
     });
     return ids;
   }
 
-  function renderTable(query,nCand,fastR,hasLlm,llmR){
-    document.getElementById('res-query').textContent=query;
-    document.getElementById('res-meta').textContent=nCand+' candidates \xb7 top 10 shown per ranker';
-    rankerOrder=Object.keys(fastR);
-    if(llmR)rankerOrder=rankerOrder.concat(Object.keys(llmR));
-    ingest(fastR);
-    if(llmR)ingest(llmR);
-    document.getElementById('thead').innerHTML='<tr><th>Paper</th>'+
-      rankerOrder.map(function(r){return '<th id="th-'+esc(r)+'">'+esc(r)+'</th>';}).join('')+'</tr>';
-    buildRows(sorted(),hasLlm&&!llmR);
-    document.getElementById('results').style.display='block';
-  }
-
-  function buildRows(ids,pending){
-    document.getElementById('tbody').innerHTML=ids.map(function(pid){
-      var p=allPapers[pid];
-      var meta=[p.year,p.venue,p.citations>0?p.citations+' citations':null].filter(Boolean).join(' \xb7 ');
-      var cells=rankerOrder.map(function(r){
-        var fast=(r==='ss_default'||r==='bm25'||r==='dense');
-        if(!fast&&pending)return '<td class="pend" id="c-'+esc(pid)+'-'+esc(r)+'"><span class="spin"></span></td>';
-        return '<td id="c-'+esc(pid)+'-'+esc(r)+'">'+rb(paperRanks[pid]?paperRanks[pid][r]:null)+'</td>';
-      }).join('');
-      return '<tr><td><div class="ptitle">'+esc(p.title)+'</div>'+(meta?'<div class="pmeta">'+esc(meta)+'</div>':'')+(p.abstract?'<div class="pabs">'+esc(p.abstract)+'</div>':'')+'</td>'+cells+'</tr>';
-    }).join('');
-  }
-
-  function mergeLlm(llmR){
-    setNotice(false);
-    // Add any new ranker columns not yet in the header
-    var newR=Object.keys(llmR).filter(function(r){return rankerOrder.indexOf(r)<0;});
-    newR.forEach(function(r){
-      rankerOrder.push(r);
-      var th=document.createElement('th');
-      th.id='th-'+r;th.textContent=r;
-      document.getElementById('thead').querySelector('tr').appendChild(th);
-    });
-    ingest(llmR);
-    // Update header text (remove any spinner text)
-    Object.keys(llmR).forEach(function(r){
-      var th=document.getElementById('th-'+r);
-      if(th)th.textContent=r;
-    });
-    // Update existing cells
-    sorted().forEach(function(pid){
-      Object.keys(llmR).forEach(function(r){
-        var cell=document.getElementById('c-'+pid+'-'+r);
-        if(!cell)return;
-        cell.innerHTML=rb(paperRanks[pid]?paperRanks[pid][r]:null);
-        cell.className='';
-      });
-    });
-    // Append new rows for papers the LLM promotes that weren't in fast top-10
-    var tbody=document.getElementById('tbody');
-    var existingIds={};sorted().forEach(function(id){existingIds[id]=1;});
-    Object.keys(llmR).forEach(function(r){
-      llmR[r].forEach(function(p){
-        if(existingIds[p.paper_id])return;
-        existingIds[p.paper_id]=1;
-        var meta=[p.year,p.venue,p.citations>0?p.citations+' citations':null].filter(Boolean).join(' \xb7 ');
-        var cells=rankerOrder.map(function(rn){
-          return '<td id="c-'+esc(p.paper_id)+'-'+esc(rn)+'">'+rb(paperRanks[p.paper_id]?paperRanks[p.paper_id][rn]:null)+'</td>';
-        }).join('');
-        var tr=document.createElement('tr');
-        tr.innerHTML='<td><div class="ptitle">'+esc(p.title)+'</div>'+(meta?'<div class="pmeta">'+esc(meta)+'</div>':'')+(p.abstract?'<div class="pabs">'+esc(p.abstract)+'</div>':'')+'</td>'+cells;
-        tbody.appendChild(tr);
-      });
-    });
+  function setSort(col){
+    if(col===null){sortCol=null;sortDir=1;}
+    else if(sortCol===col){sortDir=-sortDir;}
+    else{sortCol=col;sortDir=1;}
+    render();
   }
 
   function setNotice(on){
@@ -433,10 +450,40 @@ tr:hover td{background:#fafafa}
     if(on){el.innerHTML='<span class="spin"></span> LLM reranking in progress (~20 s)…';el.style.display='flex';}
     else{el.style.display='none';el.innerHTML='';}
   }
-  function showErr(msg){
-    setNotice(false);
-    document.querySelectorAll('.pend').forEach(function(c){c.className='err';c.innerHTML='err';});
-    console.warn('LLM job failed:',msg);
+
+  function render(){
+    document.getElementById('res-query').textContent=curQuery;
+    document.getElementById('res-meta').textContent=curN+' candidates \xb7 top 10 shown per ranker';
+    setNotice(pendingLlm);
+    var caret=function(col){
+      if(sortCol!==col)return '';
+      return '<span class="caret">'+(sortDir>0?'&#9650;':'&#9660;')+'</span>';
+    };
+    var pTh='<th class="sortable" data-col="__paper__">Paper'+(sortCol===null?'<span class="caret">&#9650;</span>':'')+'</th>';
+    var rTh=rankerOrder.map(function(r){
+      var cls='sortable'+(sortCol===r?' sorted':'');
+      return '<th class="'+cls+'" data-col="'+esc(r)+'">'+esc(r)+caret(r)+'</th>';
+    }).join('');
+    var thead=document.getElementById('thead');
+    thead.innerHTML='<tr>'+pTh+rTh+'</tr>';
+    thead.querySelectorAll('th.sortable').forEach(function(th){
+      th.onclick=function(){
+        var c=th.getAttribute('data-col');
+        setSort(c==='__paper__'?null:c);
+      };
+    });
+    var ids=orderedIds();
+    document.getElementById('tbody').innerHTML=ids.map(function(pid){
+      var p=allPapers[pid];
+      var meta=[p.year,p.venue,p.citations>0?p.citations+' citations':null].filter(Boolean).join(' \xb7 ');
+      var cells=rankerOrder.map(function(r){
+        var rk=paperRanks[pid]?paperRanks[pid][r]:null;
+        var d=compareMode?deltaHtml(pid,r):'';
+        return '<td>'+badge(rk)+d+'</td>';
+      }).join('');
+      return '<tr><td><div class="ptitle">'+esc(p.title)+'</div>'+(meta?'<div class="pmeta">'+esc(meta)+'</div>':'')+(p.abstract?'<div class="pabs">'+esc(p.abstract)+'</div>':'')+'</td>'+cells+'</tr>';
+    }).join('');
+    document.getElementById('results').style.display='block';
   }
 })();
 </script>
