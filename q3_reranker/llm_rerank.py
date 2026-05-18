@@ -44,6 +44,21 @@ DEFAULT_STRIDE = 10
 DEFAULT_NUM_PASSES = 1
 MAX_ABSTRACT_CHARS = 800
 
+# DeepSeek's documented maximum completion length. Reasoning models
+# (deepseek-v4-pro / deepseek-reasoner) spend most of this budget on the
+# chain-of-thought before emitting the short JSON answer; a small cap
+# starves the answer and yields empty content, so we use the ceiling.
+DEFAULT_MAX_TOKENS = 8192
+
+
+class LLMRerankError(RuntimeError):
+    """Raised when the LLM backend cannot produce a usable ranking.
+
+    Surfacing this loudly is deliberate: a silently-empty LLM response
+    used to fall back to the unchanged input order, which is
+    indistinguishable from ``ss_default`` and hid real backend failures.
+    """
+
 SYSTEM_PROMPT = (
     "You are an expert academic literature reviewer. Your job is to rank "
     "candidate papers by how relevant they are to a user's research query. "
@@ -65,7 +80,9 @@ class LLMBackend(Protocol):
 
     name: str
 
-    def complete(self, system: str, user: str, max_tokens: int = 1024) -> str:
+    def complete(
+        self, system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS
+    ) -> str:
         """Send a single turn and return the model's text response."""
         ...
 
@@ -77,7 +94,9 @@ class AnthropicBackend:
     model: str = DEFAULT_MODEL
     name: str = "claude"
 
-    def complete(self, system: str, user: str, max_tokens: int = 1024) -> str:
+    def complete(
+        self, system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS
+    ) -> str:
         import anthropic  # local import so other backends remain optional
 
         client = anthropic.Anthropic()
@@ -115,7 +134,9 @@ class DeepSeekBackend:
     name: str = "deepseek"
     base_url: str = "https://api.deepseek.com"
 
-    def complete(self, system: str, user: str, max_tokens: int = 1024) -> str:
+    def complete(
+        self, system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS
+    ) -> str:
         from openai import OpenAI
 
         api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -134,17 +155,29 @@ class DeepSeekBackend:
                 {"role": "user", "content": user},
             ],
         )
-        text = (resp.choices[0].message.content or "").strip()
-        if not text:
-            reasoning = getattr(resp.choices[0].message, "reasoning_content", None)
-            if reasoning:
-                logger.warning(
-                    "DeepSeek %s returned empty content with non-empty "
-                    "reasoning_content — the model may have answered only "
-                    "in its thinking trace. Returning empty string.",
-                    self.model,
-                )
-        return text
+        msg = resp.choices[0].message
+        text = (msg.content or "").strip()
+        if text:
+            return text
+
+        # Empty content. Distinguish reasoning-budget starvation (answer
+        # lived only in the thinking trace, truncated by max_tokens) from a
+        # generic empty response. Either way this is a hard failure, not a
+        # reason to fall back to the unchanged input order.
+        reasoning = getattr(msg, "reasoning_content", None)
+        finish = getattr(resp.choices[0], "finish_reason", None)
+        if reasoning:
+            raise LLMRerankError(
+                f"DeepSeek {self.model!r} returned empty content but a "
+                f"non-empty reasoning trace (finish_reason={finish!r}). The "
+                f"answer was likely truncated mid-reasoning by max_tokens="
+                f"{max_tokens}. Increase max_tokens or use a non-reasoning "
+                f"model (e.g. deepseek-chat)."
+            )
+        raise LLMRerankError(
+            f"DeepSeek {self.model!r} returned an empty response "
+            f"(finish_reason={finish!r})."
+        )
 
 
 def get_backend(name: str | None = None) -> LLMBackend:
@@ -233,7 +266,23 @@ def parse_ranked_ids(text: str, valid_ids: set[int]) -> list[int]:
                     seen.add(i)
             if ids:
                 return ids
-    return []
+
+    # Deterministic last resort: the response is non-empty but neither valid
+    # JSON nor a clean bracketed array (e.g. prose-wrapped, markdown-fenced,
+    # or a partial array). Scan every integer token in order and keep the
+    # ones that are valid window ids. The valid_ids filter makes this safe:
+    # stray numbers like years or citation counts fall outside the id range.
+    ids: list[int] = []
+    seen: set[int] = set()
+    for tok in re.findall(r"-?\d+", text):
+        try:
+            i = int(tok)
+        except ValueError:
+            continue
+        if i in valid_ids and i not in seen:
+            ids.append(i)
+            seen.add(i)
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +343,14 @@ def _rank_window(
     raw = _cached_complete(backend, SYSTEM_PROMPT, user)
     valid = {idx for idx, _ in indexed_window}
     ranked = parse_ranked_ids(raw, valid)
+    if not ranked:
+        # Total parse failure. Returning the window unchanged here is what
+        # silently made llm_rerank == ss_default; fail loudly instead.
+        raise LLMRerankError(
+            f"Could not parse any valid ranked ids from the LLM response "
+            f"for a {len(indexed_window)}-paper window. Raw response "
+            f"(first 200 chars): {raw[:200]!r}"
+        )
     missing = [idx for idx, _ in indexed_window if idx not in ranked]
     return ranked + missing
 
@@ -345,7 +402,7 @@ def rerank(
 def main() -> None:
     import argparse
 
-    from .retriever import search
+    from .sources import search
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 

@@ -223,7 +223,7 @@ _HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Q3 Reranker Demo</title>
+<title>Reranker Demo</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;background:#f8f9fa;color:#202124;font-size:14px}
@@ -266,7 +266,7 @@ tr:hover td{background:#fafafa}
 </head>
 <body>
 <div class="hdr">
-  <div class="hdr-logo">Q3 Reranker Demo</div>
+  <div class="hdr-logo">Reranker Demo</div>
   <div class="hdr-sub">Semantic Scholar &middot; BM25 &middot; Dense &middot; LLM (DeepSeek) &middot; Citation Blend</div>
 </div>
 <div class="main">

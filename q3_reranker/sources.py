@@ -1,7 +1,8 @@
 """Retrieval source dispatcher.
 
-Picks between Semantic Scholar and SerpAPI Google Scholar based on the
-``RETRIEVAL_SOURCE`` env var (default: ``serpapi``).
+Picks between arXiv, Semantic Scholar, and SerpAPI Google Scholar based on
+the ``RETRIEVAL_SOURCE`` env var (default: ``arxiv`` — free, no API key,
+full abstracts).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_source() -> str:
-    return (os.environ.get("RETRIEVAL_SOURCE") or "serpapi").lower()
+    return (os.environ.get("RETRIEVAL_SOURCE") or "arxiv").lower()
 
 
 def search(query: str, limit: int = 20, **kwargs: Any) -> list[Paper]:

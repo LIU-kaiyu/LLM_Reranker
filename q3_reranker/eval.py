@@ -139,17 +139,19 @@ def _build_rankers(
                     )
 
                 rankers["llm+citation(refs)"] = _llm_cite
+            elif source == "arxiv":
+                # arXiv carries no citation data (citation_count=0 for every
+                # paper), so the global-citation blend is mathematically a
+                # no-op identical to llm_rerank. Don't register a duplicate
+                # column — the citation feature is genuinely unavailable here.
+                # Use a non-arXiv source to enable it.
+                logger.info(
+                    "arXiv source has no citation data; skipping the "
+                    "citation-blend ranker (it would duplicate llm_rerank)."
+                )
             else:
-                # SerpAPI / arXiv / sources without per-paper reference lists:
+                # SerpAPI / sources without per-paper reference lists:
                 # fall back to global citation_count as the authority signal.
-                # Note: for arXiv, citation_count=0 for all papers, so the
-                # blend is a no-op and the result equals pure llm_rerank.
-                if source == "arxiv":
-                    logger.warning(
-                        "arXiv source has citation_count=0 for all papers; "
-                        "llm+citation(global) will be identical to llm_rerank."
-                    )
-
                 def _llm_cite_global(q: str, ps: list[Paper]) -> list[RankedResult]:
                     base = llm_rerank_fn(q, ps, backend=backend)
                     return citation_rerank_global(base, ps)

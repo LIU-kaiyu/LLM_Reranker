@@ -32,6 +32,23 @@ logger = logging.getLogger(__name__)
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache" / "arxiv"
 
+# Case-insensitive markers that flag a withdrawn submission. arXiv keeps
+# withdrawn papers in search results (often ranked highly by relevance),
+# but they are not real candidates — screen them at retrieval rather than
+# hoping a downstream reranker buries them.
+_WITHDRAWN_MARKERS = (
+    "this paper has been withdrawn",
+    "this submission has been withdrawn",
+    "paper withdrawn",
+    "withdrawn by the author",
+    "has been withdrawn by",
+)
+
+
+def _is_withdrawn(comment: str | None, abstract: str | None) -> bool:
+    haystack = f"{comment or ''} {abstract or ''}".lower()
+    return any(m in haystack for m in _WITHDRAWN_MARKERS)
+
 _ATOM = "http://www.w3.org/2005/Atom"
 _ARXIV_NS = "http://arxiv.org/schemas/atom"
 _NS = {"a": _ATOM, "arxiv": _ARXIV_NS}
@@ -106,6 +123,11 @@ def _entry_to_dict(entry: ET.Element) -> dict[str, Any]:
         venue = pcat.get("term") if pcat is not None else None
 
     doi = (entry.findtext("arxiv:doi", namespaces=_NS) or "").strip()
+    comment = (
+        (entry.findtext("arxiv:comment", namespaces=_NS) or "")
+        .strip()
+        .replace("\n", " ")
+    )
 
     return {
         "paper_id": paper_id,
@@ -115,6 +137,7 @@ def _entry_to_dict(entry: ET.Element) -> dict[str, Any]:
         "authors": authors,
         "venue": venue,
         "doi": doi or None,
+        "comment": comment or None,
     }
 
 
@@ -189,13 +212,28 @@ def search(
         logger.info("Cached %d arXiv entries to %s", len(entries), cache_path.name)
 
     papers: list[Paper] = []
+    n_withdrawn = 0
     for d in entries:
+        if _is_withdrawn(d.get("comment"), d.get("abstract")):
+            n_withdrawn += 1
+            logger.info(
+                "Screening withdrawn arXiv paper %r: %s",
+                d.get("paper_id"),
+                (d.get("title") or "")[:80],
+            )
+            continue
         try:
             papers.append(_dict_to_paper(d))
         except Exception as exc:
             logger.warning(
                 "Skipping malformed arXiv entry %r: %s", d.get("paper_id"), exc
             )
+    if n_withdrawn:
+        logger.info(
+            "Screened %d withdrawn paper(s) from %d arXiv entries",
+            n_withdrawn,
+            len(entries),
+        )
     return papers
 
 
