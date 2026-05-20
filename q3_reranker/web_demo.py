@@ -198,13 +198,24 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         idx = payload.get("preset_idx")
-        if not isinstance(idx, int) or not (0 <= idx < len(self._presets)):
-            self.send_error(400, "Invalid preset_idx")
-            return
+        raw_query = payload.get("query")
 
-        preset = self._presets[idx]
-        retrieval_query: str = preset["retrieval_query"]
-        nl_query: str = preset["query"]
+        if isinstance(raw_query, str) and raw_query.strip():
+            # Free-text search: the same string drives both retrieval and the
+            # natural-language reranking prompt.
+            custom = raw_query.strip()
+            if len(custom) > 300:
+                self.send_error(400, "Query too long (max 300 chars)")
+                return
+            retrieval_query = custom
+            nl_query = custom
+        elif isinstance(idx, int) and 0 <= idx < len(self._presets):
+            preset = self._presets[idx]
+            retrieval_query = preset["retrieval_query"]
+            nl_query = preset["query"]
+        else:
+            self.send_error(400, "Provide a non-empty 'query' or valid 'preset_idx'")
+            return
 
         try:
             papers = search(retrieval_query, limit=_LIMIT)
@@ -285,6 +296,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-s
 .chip{background:#fff;border:1px solid #dadce0;border-radius:20px;padding:7px 14px;font-size:13px;cursor:pointer;color:#3c4043;transition:background .12s,border-color .12s;white-space:nowrap}
 .chip:hover{background:#f1f3f4;border-color:#bdc1c6}
 .chip.active{background:#e8f0fe;border-color:#1a73e8;color:#1a73e8;font-weight:500}
+.searchbox{display:flex;gap:8px;margin-bottom:24px;max-width:680px}
+.searchbox input{flex:1;padding:10px 16px;font-size:14px;border:1px solid #dadce0;border-radius:24px;outline:none;font-family:inherit;color:#202124}
+.searchbox input:focus{border-color:#1a73e8;box-shadow:0 1px 6px rgba(26,115,232,.2)}
+.searchbox button{padding:10px 22px;font-size:14px;font-weight:500;color:#fff;background:#1a73e8;border:none;border-radius:24px;cursor:pointer}
+.searchbox button:hover{background:#1765cc}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid #e8eaed;border-top-color:#1a73e8;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
 #loading{display:none;padding:40px;text-align:center;color:#5f6368}
@@ -334,7 +350,13 @@ th.sorted{color:#1a73e8}
   <div class="hdr-sub">__SOURCE__ &middot; BM25 &middot; Dense &middot; RRF &middot; Cross-encoder &middot; LLM rerank</div>
 </div>
 <div class="main">
-  <div class="sec-title">Select a benchmark query</div>
+  <div class="sec-title">Search any query</div>
+  <form class="searchbox" id="searchform">
+    <input id="qinput" type="text" maxlength="300" autocomplete="off"
+           placeholder="e.g. monocular depth estimation, recent SOTA">
+    <button type="submit">Search</button>
+  </form>
+  <div class="sec-title">Or select a benchmark query</div>
   <div class="chips" id="chips"></div>
   <div id="loading"><div class="spin"></div>Retrieving papers&hellip;</div>
   <div id="errbox"></div>
@@ -404,6 +426,18 @@ th.sorted{color:#1a73e8}
   function selectPreset(idx,btn){
     document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active');});
     btn.classList.add('active');
+    runSearch({preset_idx:idx});
+  }
+
+  document.getElementById('searchform').addEventListener('submit',function(e){
+    e.preventDefault();
+    var q=document.getElementById('qinput').value.trim();
+    if(!q){showErr('Enter a query to search.');return;}
+    document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active');});
+    runSearch({query:q});
+  });
+
+  function runSearch(body){
     if(pollT){clearInterval(pollT);pollT=null;}
     currentJob=null;allPapers={};paperRanks={};rankerOrder=[];
     sortCol=null;sortDir=1;pendingLlm=false;
@@ -413,7 +447,7 @@ th.sorted{color:#1a73e8}
     fetch('/api/search',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({preset_idx:idx})
+      body:JSON.stringify(body)
     }).then(function(r){return r.json();}).then(function(d){
       document.getElementById('loading').style.display='none';
       if(d.error){showErr(d.error);return;}
