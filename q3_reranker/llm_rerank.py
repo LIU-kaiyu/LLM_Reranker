@@ -155,6 +155,16 @@ class DeepSeekBackend:
                 {"role": "user", "content": user},
             ],
         )
+        # DeepSeek occasionally returns HTTP 200 with a null/empty ``choices``
+        # array under load. Indexing it directly raised a cryptic
+        # ``'NoneType' object is not subscriptable``; guard and surface a
+        # clear, retryable error instead.
+        if not resp.choices:
+            raise LLMRerankError(
+                f"DeepSeek {self.model!r} returned a 200 response with no "
+                f"choices (id={getattr(resp, 'id', None)!r}). This is "
+                f"usually a transient server-side hiccup — retry shortly."
+            )
         msg = resp.choices[0].message
         text = (msg.content or "").strip()
         if text:
@@ -306,13 +316,31 @@ def _cached_complete(backend: LLMBackend, system: str, user: str) -> str:
     key = _cache_key(model, system, user)
     path = CACHE_DIR / f"{key}.json"
 
+    # Cache-hit path: self-heal poisoned entries written by older code that
+    # silently swallowed empty backend responses. Treat any empty/whitespace
+    # response as corrupted, drop it, and fall through to a fresh fetch.
     if path.exists():
         cached = json.loads(path.read_text())
-        logger.info("LLM cache hit (%s)", key)
-        return cached["response"]
+        cached_text = (cached.get("response") or "").strip()
+        if cached_text:
+            logger.info("LLM cache hit (%s)", key)
+            return cached_text
+        logger.warning(
+            "Discarding empty LLM cache entry (%s); re-fetching from %s",
+            key, backend.name,
+        )
+        path.unlink()
 
     logger.info("LLM cache miss (%s); calling backend %s", key, backend.name)
     text = backend.complete(system, user)
+    # Refuse to persist empty responses so the cache cannot poison itself.
+    # ``DeepSeekBackend.complete`` already raises on empty; this is a
+    # belt-and-braces guard for any backend that returns "" without raising.
+    if not text.strip():
+        raise LLMRerankError(
+            f"Backend {backend.name!r} returned an empty response; refusing "
+            f"to cache. Check the model name and API key, then retry."
+        )
     path.write_text(
         json.dumps(
             {

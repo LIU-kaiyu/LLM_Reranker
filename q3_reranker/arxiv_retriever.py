@@ -174,10 +174,6 @@ def _dict_to_paper(d: dict[str, Any]) -> Paper:
 
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_S = 3  # 3s → 6s → 12s
-# (connect, read) — arXiv's Atom endpoint is occasionally slow to assemble
-# broad queries; 30s read was too tight and caused unretried client-side
-# timeouts. 60s is empirically enough for the worst arXiv responses.
-_TIMEOUT_S: tuple[int, int] = (10, 60)
 
 
 def _fetch(query: str, limit: int) -> list[dict[str, Any]]:
@@ -190,26 +186,10 @@ def _fetch(query: str, limit: int) -> list[dict[str, Any]]:
     }
 
     last_status: int | None = None
-    last_network_error: Exception | None = None
     for attempt in range(_MAX_ATTEMPTS):
         # Courtesy delay BEFORE the call so bursts don't trip arXiv's limiter.
         time.sleep(1)
-        try:
-            resp = requests.get(ARXIV_API_URL, params=params, timeout=_TIMEOUT_S)
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            last_network_error = exc
-            if attempt == _MAX_ATTEMPTS - 1:
-                break
-            wait = _BACKOFF_BASE_S * (2**attempt)
-            logger.warning(
-                "arXiv network error %s (attempt %d/%d); retrying in %.0fs",
-                exc.__class__.__name__,
-                attempt + 1,
-                _MAX_ATTEMPTS,
-                wait,
-            )
-            time.sleep(wait)
-            continue
+        resp = requests.get(ARXIV_API_URL, params=params, timeout=30)
 
         if resp.status_code == 200:
             root = ET.fromstring(resp.content)
@@ -237,13 +217,6 @@ def _fetch(query: str, limit: int) -> list[dict[str, Any]]:
         # Non-retryable HTTP error.
         resp.raise_for_status()
 
-    if last_network_error is not None and last_status is None:
-        raise ArxivRateLimitError(
-            f"arXiv did not respond within {_TIMEOUT_S[1]}s "
-            f"after {_MAX_ATTEMPTS} attempts "
-            f"({last_network_error.__class__.__name__}). "
-            f"Try again, or use a more specific query."
-        ) from last_network_error
     raise ArxivRateLimitError(
         f"arXiv is rate-limiting requests (last status {last_status}) and did "
         f"not recover after {_MAX_ATTEMPTS} attempts. Try again in a minute, "

@@ -26,6 +26,7 @@ from .arxiv_retriever import ArxivRateLimitError
 from .baselines import RankedResult
 from .eval import _build_rankers
 from .gold import load_gold
+from .query_expand import expand as expand_query
 from .retriever import Paper
 from .sources import get_source, search
 
@@ -186,7 +187,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/api/search":
+        if self.path not in ("/api/search", "/api/expand_query"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -197,10 +198,44 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(400, "Bad JSON")
             return
 
+        if self.path == "/api/expand_query":
+            raw_text = payload.get("raw")
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                self.send_error(400, "Provide a non-empty 'raw' string")
+                return
+            if len(raw_text) > 300:
+                self.send_error(400, "Query too long (max 300 chars)")
+                return
+            try:
+                expansion = expand_query(raw_text)
+            except Exception as exc:  # noqa: BLE001 - never crash the thread
+                logger.error("Query expansion failed: %s", exc, exc_info=True)
+                self._send_json({"error": f"Expansion failed: {exc}"}, 503)
+                return
+            self._send_json({
+                "kind": expansion.kind,
+                "retrieval_query": expansion.retrieval_query,
+                "nl_query": expansion.nl_query,
+                "raw": expansion.raw,
+            })
+            return
+
+        # /api/search
         idx = payload.get("preset_idx")
         raw_query = payload.get("query")
+        explicit_retrieval = payload.get("retrieval_query")
 
-        if isinstance(raw_query, str) and raw_query.strip():
+        if (
+            isinstance(explicit_retrieval, str) and explicit_retrieval.strip()
+            and isinstance(raw_query, str) and raw_query.strip()
+        ):
+            # Reviewed-and-approved smart query: caller supplied both forms.
+            retrieval_query = explicit_retrieval.strip()
+            nl_query = raw_query.strip()
+            if len(retrieval_query) > 300 or len(nl_query) > 500:
+                self.send_error(400, "Query too long")
+                return
+        elif isinstance(raw_query, str) and raw_query.strip():
             # Free-text search: the same string drives both retrieval and the
             # natural-language reranking prompt.
             custom = raw_query.strip()
@@ -214,7 +249,7 @@ class _Handler(BaseHTTPRequestHandler):
             retrieval_query = preset["retrieval_query"]
             nl_query = preset["query"]
         else:
-            self.send_error(400, "Provide a non-empty 'query' or valid 'preset_idx'")
+            self.send_error(400, "Provide 'query', '{retrieval_query, query}', or a valid 'preset_idx'")
             return
 
         try:
@@ -301,6 +336,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-s
 .searchbox input:focus{border-color:#1a73e8;box-shadow:0 1px 6px rgba(26,115,232,.2)}
 .searchbox button{padding:10px 22px;font-size:14px;font-weight:500;color:#fff;background:#1a73e8;border:none;border-radius:24px;cursor:pointer}
 .searchbox button:hover{background:#1765cc}
+#review{display:none;background:#fff;border:1px solid #dadce0;border-radius:8px;padding:18px 18px 14px;margin-bottom:24px;max-width:680px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.rev-hdr{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px;font-size:13px;color:#3c4043;flex-wrap:wrap}
+.rev-hdr .rev-kind-tag{background:#e8f0fe;color:#1a73e8;padding:2px 10px;border-radius:10px;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.rev-row{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.rev-lbl{font-size:11px;color:#5f6368;font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+.rev-lbl .rev-sub{text-transform:none;font-weight:400;color:#9aa0a6;margin-left:4px}
+.rev-row input{padding:9px 12px;font-size:14px;border:1px solid #dadce0;border-radius:6px;outline:none;font-family:inherit;color:#202124}
+.rev-row input:focus{border-color:#1a73e8;box-shadow:0 1px 6px rgba(26,115,232,.2)}
+.rev-btns{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}
+.rev-btns button{padding:8px 18px;font-size:13px;border-radius:18px;cursor:pointer;border:1px solid transparent;font-family:inherit}
+#rev-cancel{background:#fff;border-color:#dadce0;color:#3c4043}
+#rev-cancel:hover{background:#f1f3f4}
+#rev-go{background:#1a73e8;border-color:#1a73e8;color:#fff;font-weight:500}
+#rev-go:hover{background:#1765cc}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid #e8eaed;border-top-color:#1a73e8;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
 #loading{display:none;padding:40px;text-align:center;color:#5f6368}
@@ -353,9 +402,27 @@ th.sorted{color:#1a73e8}
   <div class="sec-title">Search any query</div>
   <form class="searchbox" id="searchform">
     <input id="qinput" type="text" maxlength="300" autocomplete="off"
-           placeholder="e.g. monocular depth estimation, recent SOTA">
+           placeholder="Type a question OR keywords — the LLM will fill in the other form">
     <button type="submit">Search</button>
   </form>
+  <div id="review">
+    <div class="rev-hdr">
+      <span>LLM read your input as: <span class="rev-kind-tag" id="rev-kind">…</span></span>
+      <span class="hint">Edit either field if needed, then Run.</span>
+    </div>
+    <div class="rev-row">
+      <span class="rev-lbl">Keyword query <span class="rev-sub">(sent to the retrieval API)</span></span>
+      <input id="rev-kw" type="text" maxlength="300" autocomplete="off">
+    </div>
+    <div class="rev-row">
+      <span class="rev-lbl">Natural-language query <span class="rev-sub">(used as the LLM reranker prompt)</span></span>
+      <input id="rev-nl" type="text" maxlength="500" autocomplete="off">
+    </div>
+    <div class="rev-btns">
+      <button id="rev-cancel" type="button">Cancel</button>
+      <button id="rev-go" type="button">Run search</button>
+    </div>
+  </div>
   <div class="sec-title">Or select a benchmark query</div>
   <div class="chips" id="chips"></div>
   <div id="loading"><div class="spin"></div>Retrieving papers&hellip;</div>
@@ -429,12 +496,52 @@ th.sorted{color:#1a73e8}
     runSearch({preset_idx:idx});
   }
 
+  function hideReview(){document.getElementById('review').style.display='none';}
+  function showReview(d){
+    var kind=d.kind==='nl'?'natural-language':d.kind==='keyword'?'keywords':'unclassified';
+    document.getElementById('rev-kind').textContent=kind;
+    document.getElementById('rev-kw').value=d.retrieval_query||'';
+    document.getElementById('rev-nl').value=d.nl_query||'';
+    document.getElementById('review').style.display='block';
+    document.getElementById('rev-kw').focus();
+  }
+  function setLoading(msg){
+    var el=document.getElementById('loading');
+    el.innerHTML='<div class="spin"></div>'+msg;
+    el.style.display='block';
+  }
+
   document.getElementById('searchform').addEventListener('submit',function(e){
     e.preventDefault();
     var q=document.getElementById('qinput').value.trim();
     if(!q){showErr('Enter a query to search.');return;}
     document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active');});
-    runSearch({query:q});
+    hideReview();
+    clearErr();
+    document.getElementById('results').style.display='none';
+    setLoading('Understanding your query&hellip;');
+    fetch('/api/expand_query',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({raw:q})
+    }).then(function(r){return r.json();}).then(function(d){
+      document.getElementById('loading').style.display='none';
+      if(d.error){showErr(d.error);return;}
+      showReview(d);
+    }).catch(function(e){
+      document.getElementById('loading').style.display='none';
+      showErr('Expansion request failed: '+e);
+    });
+  });
+
+  document.getElementById('rev-cancel').addEventListener('click',hideReview);
+  document.getElementById('rev-go').addEventListener('click',function(){
+    var kw=document.getElementById('rev-kw').value.trim();
+    var nl=document.getElementById('rev-nl').value.trim();
+    if(!kw||!nl){showErr('Both fields are required.');return;}
+    hideReview();
+    setLoading('Retrieving papers&hellip;');
+    runSearch({retrieval_query:kw, query:nl});
   });
 
   function runSearch(body){
@@ -443,7 +550,7 @@ th.sorted{color:#1a73e8}
     sortCol=null;sortDir=1;pendingLlm=false;
     clearErr();
     document.getElementById('results').style.display='none';
-    document.getElementById('loading').style.display='block';
+    setLoading('Retrieving papers&hellip;');
     fetch('/api/search',{
       method:'POST',
       headers:{'Content-Type':'application/json'},

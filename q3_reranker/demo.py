@@ -28,6 +28,7 @@ from pathlib import Path
 from .baselines import RankedResult
 from .eval import _build_rankers, mrr, ndcg_at_k, recall_at_k
 from .gold import GoldStage, gold_for_query, grade_for
+from .query_expand import QueryExpansion, expand
 from .sources import get_source, search
 
 _SOURCE_LABELS = {
@@ -96,6 +97,51 @@ def _print_metrics(
         print(f"  {name:14s}  {n:.3f}    {m:.3f}  {rec:.3f}")
 
 
+def _review_expansion(exp: QueryExpansion, auto_approve: bool) -> tuple[str, str]:
+    """Show the LLM expansion and let the user approve / edit / reject.
+
+    Returns ``(retrieval_query, nl_query)``. Raises ``SystemExit`` if the
+    user rejects.
+    """
+    kind_label = {
+        "nl": "natural-language question",
+        "keyword": "keyword query",
+        "unknown": "unclassified (LLM expansion failed; using raw text for both forms)",
+    }.get(exp.kind, exp.kind)
+
+    print()
+    print(f"LLM classification: {kind_label}")
+    print(f"  retrieval_query: {exp.retrieval_query}")
+    print(f"  nl_query:        {exp.nl_query}")
+    print()
+
+    if auto_approve:
+        print("--yes given; running without review.")
+        return exp.retrieval_query, exp.nl_query
+
+    retrieval = exp.retrieval_query
+    nl = exp.nl_query
+    while True:
+        choice = input("Approve and run? [y]es / [e]dit / [n]o: ").strip().lower()
+        if choice in ("y", "yes", ""):
+            return retrieval, nl
+        if choice in ("n", "no"):
+            raise SystemExit("Aborted by user.")
+        if choice in ("e", "edit"):
+            new_r = input(f"  retrieval_query [{retrieval}]: ").strip()
+            new_n = input(f"  nl_query        [{nl}]: ").strip()
+            if new_r:
+                retrieval = new_r
+            if new_n:
+                nl = new_n
+            print()
+            print(f"  retrieval_query: {retrieval}")
+            print(f"  nl_query:        {nl}")
+            print()
+            continue
+        print("Please answer y / e / n.")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -108,12 +154,28 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Side-by-side reranker demo.")
     parser.add_argument(
-        "--query", required=True, help="Keyword retrieval query (sent to Scholar)."
+        "--query",
+        default=None,
+        help="Keyword retrieval query (sent to Scholar). Required unless --text is given.",
     )
     parser.add_argument(
         "--nl-query",
         default=None,
         help="Natural-language query for the LLM reranker (defaults to --query).",
+    )
+    parser.add_argument(
+        "--text",
+        default=None,
+        help=(
+            "Single user query in either form (NL question or keywords). "
+            "An LLM expander classifies it and produces the counterpart; "
+            "you review/edit/approve before retrieval runs."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive review prompt when using --text.",
     )
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--top-k", type=int, default=10)
@@ -121,11 +183,21 @@ def main() -> None:
     parser.add_argument("--no-citation", action="store_true")
     args = parser.parse_args()
 
-    nl_query = args.nl_query or args.query
+    if args.text and args.query:
+        parser.error("Use --text OR --query, not both.")
+    if not args.text and not args.query:
+        parser.error("One of --text or --query is required.")
 
-    papers = search(args.query, limit=args.limit)
+    if args.text:
+        exp = expand(args.text)
+        retrieval_query, nl_query = _review_expansion(exp, auto_approve=args.yes)
+    else:
+        retrieval_query = args.query
+        nl_query = args.nl_query or args.query
+
+    papers = search(retrieval_query, limit=args.limit)
     if not papers:
-        print(f"No papers found for: {args.query!r}")
+        print(f"No papers found for: {retrieval_query!r}")
         return
 
     rankers = _build_rankers(
@@ -137,10 +209,10 @@ def main() -> None:
         name: ranker(nl_query, papers) for name, ranker in rankers.items()
     }
 
-    gold = gold_for_query(args.query)
+    gold = gold_for_query(retrieval_query)
     source_label = _SOURCE_LABELS.get(get_source(), get_source())
     print(
-        f"\nQuery: {args.query!r}  "
+        f"\nQuery: {retrieval_query!r}  "
         f"({len(papers)} candidates from {source_label})\n"
     )
     _print_table(rankings, top_k=args.top_k, gold=gold)

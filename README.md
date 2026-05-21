@@ -148,8 +148,9 @@ All variables are loaded from `.env` automatically when using any module's `main
 | `gold.py` | 4 | Loads gold-label JSON files (`data/gold/queries.json` by default; `queries_arxiv.json` for arXiv). Parses relevance grades 0–3. Fuzzy title normalisation for matching retrieved papers against hand-labeled gold. |
 | `eval.py` | 4 | Orchestrates all rankers over all gold stages. Computes NDCG@10, MRR, Recall@10. Writes `reports/q3_results.md` by default. |
 | `citation_rerank.py` | 6 | Novel angle. `citation_rerank`: in-set graph via SS batch API (requires `semantic_scholar` source). `citation_rerank_global`: log1p-normalised global citation count fallback for SerpAPI. |
-| `demo.py` | 5 | CLI: column-aligned side-by-side top-K comparison table. |
-| `web_demo.py` | 6 | Browser-based demo. Pure Python stdlib HTTP server (`ThreadingHTTPServer`). Two-phase response: fast rankers sync, LLM rankers via background thread + client polling. |
+| `query_expand.py` | 7 | Smart query expander. Classifies a user string as natural-language vs. keyword query and generates the counterpart via the LLM backend. Graceful fallback to raw text on any failure. |
+| `demo.py` | 5 | CLI: column-aligned side-by-side top-K comparison table. `--text` runs the smart expander with an interactive review prompt. |
+| `web_demo.py` | 6 | Browser-based demo. Pure Python stdlib HTTP server (`ThreadingHTTPServer`). Two-phase response: fast rankers sync, LLM rankers via background thread + client polling. Custom search box with LLM expansion + review panel. |
 
 ### Data flow
 
@@ -219,6 +220,16 @@ python -m q3_reranker.demo \
 
 `--query` is the keyword form sent to the retrieval backend. `--nl-query` is the natural-language form passed to the LLM reranker (defaults to `--query` when omitted).
 
+Or pass a **single** string in either form with `--text` and let the LLM expander
+classify it and generate the counterpart. Both forms are printed and you get a
+`[y]es / [e]dit / [n]o` prompt before retrieval runs; `--yes` skips the prompt.
+
+```bash
+python -m q3_reranker.demo \
+    --text "what papers established self-supervised monocular depth?" \
+    --top-k 5
+```
+
 ### Full evaluation
 
 ```bash
@@ -258,7 +269,15 @@ The UI shows **8 preset chips** (one per gold benchmark stage). Clicking a chip 
 
 The table uses a **papers-as-rows, rankers-as-columns** layout. Papers are the union of all rankers' top-10, sorted by `ss_default` rank. Rank badges: green = 1, amber = 2–3, blue = 4–10, grey dash = not in top-10.
 
-Only preset chips are shown — no free-text search box — so no SerpAPI credits are spent beyond what the evaluation already cached.
+### Custom search
+
+Above the preset chips, a free-text search box accepts any query (≤ 300 chars) in **either** form — a natural-language question or a keyword query. Submitting it:
+
+1. Calls `POST /api/expand_query`, which uses the LLM expander to classify the input and generate the missing counterpart.
+2. Shows a **review panel** with both forms in editable fields — correct either, then click **Run search**.
+3. On approval, the keyword form drives retrieval and the natural-language form is the reranker prompt (the same two-query design the gold stages use).
+
+Preset chips spend no credits (all cached). A novel custom query calls the live source — free on arXiv, one SerpAPI credit per new query — and is cached on disk by SHA256 so repeats are instant.
 
 **Endpoints:**
 
@@ -266,7 +285,8 @@ Only preset chips are shown — no free-text search box — so no SerpAPI credit
 |---|---|---|
 | `GET` | `/` | Single-page app HTML |
 | `GET` | `/api/presets` | JSON array of gold stages |
-| `POST` | `/api/search` | `{preset_idx}` → fast rankings + `job_id` |
+| `POST` | `/api/expand_query` | `{raw}` → `{kind, retrieval_query, nl_query}` |
+| `POST` | `/api/search` | `{preset_idx}`, `{query}`, or `{retrieval_query, query}` → fast rankings + `job_id` |
 | `GET` | `/api/llm/{job_id}` | `{status: pending\|done\|error, rankings}` |
 
 ---
